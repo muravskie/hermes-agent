@@ -34,6 +34,243 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# Tool description compression (reduces token overhead without losing critical info)
+# =============================================================================
+
+# Pattern for "Also available" utility blocks — always at end of description.
+_RE_ALSO_AVAILABLE = re.compile(r'\nAlso available.*', re.DOTALL)
+
+
+def _compress_tool_descriptions(
+    tools: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Compress tool descriptions for token savings.
+
+    PRESERVES: full parameter schemas, IMPORTANT/CRITICAL/WARNING constraints,
+    tool-specific operational facts (paths, ports, limits with values).
+
+    STRIPS: redundant SOUL meta-instructions ("Do NOT use X, use Y instead"),
+    verbose example lists for simple tools, "Also available" utility function
+    signatures, "Limits:" info lines, "Scripts run in" explanations.
+    """
+    compressed = []
+
+    for tool in tools:
+        func = tool.get("function", {})
+        desc = func.get("description", "")
+        name = func.get("name", "")
+        cd = desc
+
+        # --- TOOL-SPECIFIC COMPRESSORS ---
+
+        if name == "execute_code":
+            # Replace the entire block of embedded tool signatures (2200+ chars)
+            # with a compact list. Preserves the "Use this when..." guidance
+            # and "Print your final result to stdout" directive.
+            lines = cd.split("\n")
+            new_lines: list[str] = []
+            skip = False
+            for i, line in enumerate(lines):
+                if "Available via" in line:
+                    skip = True
+                    new_lines.append(
+                        "Available: web_search, web_extract, read_file, "
+                        "write_file, search_files, patch, terminal. "
+                        "Utilities: json_parse, shell_quote, retry.",
+                    )
+                    continue
+                if skip:
+                    # Stop skipping when we hit the blank line before
+                    # "Print your final result to stdout"
+                    if (
+                        line.strip() == ""
+                        and i + 1 < len(lines)
+                        and "Print your final result to stdout" in lines[i + 1]
+                    ):
+                        skip = False
+                    else:
+                        continue
+                new_lines.append(line)
+            cd = "\n".join(new_lines)
+
+        elif name == "terminal":
+            # Strip "Do NOT use X — use Y instead" chains (already in SOUL)
+            cd = re.sub(r"Do NOT use [^\n]+use [^\n]+\.\n*", "", cd)
+            # Remove "Reserve terminal for:" meta-instruction
+            cd = cd.replace(
+                "Reserve terminal for: builds, installs, git, processes, "
+                "scripts, network, package managers, and anything that needs "
+                "a shell.\n",
+                "",
+            )
+            # Compress Foreground/Background verbose blocks
+            cd = cd.replace(
+                "Foreground (default): Commands return INSTANTLY when done, "
+                "even if the timeout is high. Set timeout=300 for long "
+                "builds/scripts — you'll still get the result in seconds if "
+                "it's fast. Prefer foreground for short commands.\n",
+                "Foreground (default). Set timeout=N for long tasks.\n",
+            )
+            cd = cd.replace(
+                "Background: Set background=true to get a session_id. Two "
+                "patterns:\n"
+                "  (1) Long-lived processes that never exit (servers, "
+                "watchers).\n"
+                "  (2) Long-running tasks with notify_on_complete=true — you "
+                "can keep working on other things and the system auto-notifies "
+                "you when the task finishes. Great for test suites, builds, "
+                "deployments, or anything that takes more than a minute.\n",
+                "Background: Use background=true. For long-lived processes or "
+                "long tasks with notify_on_complete=true.\n",
+            )
+            # Remove detailed process management explanations
+            cd = cd.replace(
+                "For servers/watchers, do NOT use shell-level background "
+                "wrappers (nohup/disown/setsid/trailing '&') in foreground "
+                "mode. Use background=true so Hermes can track lifecycle and "
+                "output.\n",
+                "",
+            )
+            cd = cd.replace(
+                "After starting a server, verify readiness with a health "
+                "check or log signal, then run tests in a separate terminal() "
+                "call. Avoid blind sleep loops.\n",
+                "",
+            )
+            cd = cd.replace(
+                'Use process(action="poll") for progress checks, '
+                'process(action="wait") to block until done.\n',
+                "",
+            )
+            # Compress PTY explanation
+            cd = cd.replace(
+                "PTY mode: Set pty=true for interactive CLI tools (Codex, "
+                "Claude Code, Python REPL).\n",
+                "PTY mode: Set pty=true for interactive tools (REPL, Codex, "
+                "Claude Code).\n",
+            )
+            # Remove redundant vim/nano warning
+            cd = cd.replace(
+                "Do NOT use vim/nano/interactive tools without pty=true — "
+                "they hang without a pseudo-terminal. Pipe git output to cat "
+                "if it might page.\n",
+                "",
+            )
+
+        elif name == "browser_navigate":
+            cd = cd.replace(
+                " For simple information retrieval, prefer web_search or "
+                "web_extract (faster, cheaper).",
+                "",
+            )
+            cd = cd.replace(
+                " For plain-text endpoints — URLs ending in .md, .txt, .json, "
+                ".yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any "
+                "documented API endpoint — prefer curl via the terminal tool "
+                "or web_extract; the browser stack is overkill and much slower "
+                "for these.",
+                " For plain-text endpoints (raw files, APIs), prefer "
+                "terminal/web_extract instead.",
+            )
+
+        elif name == "delegate_task":
+            cd = cd.replace(
+                "Spawn subagents in isolated contexts. Only the final summary returns — intermediate tool results never enter your context window.\n\nSingle task: provide 'goal'. Batch: provide 'tasks' array (up to 3 parallel). Nested delegation is OFF for this user (max_spawn_depth=1): every child is a leaf and cannot delegate further. Raise delegation.max_spawn_depth in config.yaml to enable nesting.\n\nUse for: reasoning-heavy subtasks, context-flooding intermediate data, parallel workstreams.\nSkip for: single tool calls, mechanical loops (use execute_code), tasks needing clarify, or work that must outlive this turn (use cronjob or terminal background=true).\n\nSubagents have NO conversation memory — pass all context via the 'context' field. Include language/style instructions in context if the user isn't writing in English. Summaries are self-reports; verify side-effects (file writes, HTTP posts) independently.",
+                "Spawn subagents in isolated contexts. Only final summary returns.\n\nSingle task: provide 'goal'. Batch: 'tasks' array (up to 3 parallel).\n\nUse for: reasoning subtasks, parallel workstreams. Skip for: single tool calls, mechanical loops, tasks needing user input.\n\nNO conversation memory — pass all context via 'context' field. Summaries are self-reports; verify side-effects independently.",
+            )
+
+        elif name == "clarify":
+            cd = cd.replace(
+                "Use this tool when:\n- The task is ambiguous and you need "
+                "the user to choose an approach\n- You want post-task feedback "
+                "('How did that work out?')\n- You want to offer to save a "
+                "skill or update memory\n- A decision has meaningful trade-offs "
+                "the user should weigh in on\n\nDo NOT use this tool for "
+                "simple yes/no confirmation of dangerous commands (the terminal "
+                "tool handles that). Prefer making a reasonable default choice "
+                "yourself when the decision is low-stakes.",
+                "Use when task is ambiguous, user needs to choose, or decision "
+                "has meaningful trade-offs. Not for simple yes/no "
+                "confirmations.",
+            )
+
+        elif name == "session_search":
+            cd = cd.replace(
+                "Search past sessions (FTS5-backed SQLite). Three shapes:\n1) DISCOVERY: pass query — returns top N sessions with snippet, ±5-message window around the match, and bookend_start/end (first/last 3 messages). Reconstructs goal→match→resolution without loading the full transcript.\n2) SCROLL: pass session_id + around_message_id — returns ±window messages around the anchor. Forward: pass messages[-1].id; backward: pass messages[0].id. Boundary message appears in both windows.\n3) BROWSE: no args — recent sessions by time.\nFTS5: AND default, OR/NOT/phrases/wildcards supported (`\"exact phrase\"`, `deploy*`).\nUse for any 'what did we do about X / where did we leave Y' question.",
+                "Search past sessions (FTS5 SQLite). Three shapes:\n1) DISCOVERY: query — returns sessions with snippet, ±5 msg window, bookends.\n2) SCROLL: session_id + around_message_id — returns ±window messages.\n3) BROWSE: no args — recent sessions.\nUse for 'what did we do about X' questions.",
+            )
+
+        elif name == "browser_cdp":
+            # Remove verbose "Common patterns" examples
+            cd = re.sub(
+                r"\n\*\*Common patterns:\*\*.*?(?=\n\*\*Usage rules:\*\*)",
+                "",
+                cd,
+                flags=re.DOTALL,
+            )
+
+        elif name == "video_generate":
+            cd = cd.replace(
+                "Generates short video clips from text prompts. Use for "
+                "creating short animations, visualizations, or video content "
+                "from descriptions.",
+                "Generates short video clips from text prompts.",
+            )
+
+        elif name == "cronjob":
+            cd = cd.replace(
+                "Jobs run in a fresh session with no current-chat context, "
+                "so prompts must be self-contained.\nIf skills are provided "
+                "on create, the future cron run loads those skills in order, "
+                "then follows the prompt as the task instruction.\nOn update, "
+                "passing skills=[] clears attached skills.",
+                "Jobs run in fresh session (no chat context). Skills load in "
+                "order; skills=[] clears.",
+            )
+
+        elif name == "skill_manage":
+            cd = cd.replace(
+                "Good skills: trigger conditions, numbered steps with exact "
+                "commands, pitfalls, verification steps. Use skill_view() to "
+                "see format examples.",
+                "Good skills: trigger conditions, steps with commands, "
+                "pitfalls, verification.",
+            )
+
+        elif name == "todo":
+            cd = cd.replace(
+                "Manage your task list for the current session. Use for complex tasks with 3+ steps or when the user provides multiple tasks. Call with no parameters to read the current list.\n\nWriting:\n- Provide 'todos' array to create/update items\n- merge=false (default): replace the entire list with a fresh plan\n- merge=true: update existing items by id, add any new ones\n\nEach item: {id: string, content: string, status: pending|in_progress|completed|cancelled}\nList order is priority. Only ONE item in_progress at a time.\nMark items completed immediately when done. If something fails, cancel it and add a revised item.\n\nAlways returns the full current list.",
+                "Manage task list. For 3+ step tasks or multiple tasks.\n\nWriting: 'todos' array; merge=false replaces, merge=true updates/adds.\nEach item: {id, content, status: pending|in_progress|completed|cancelled}.\nONE in_progress at a time. Cancel failed items + add revised.\nAlways returns full list.",
+            )
+
+        # --- GLOBAL COMPRESSIONS (apply to all tools) ---
+
+        # Strip "Also available" utility blocks
+        cd = _RE_ALSO_AVAILABLE.sub("", cd)
+        # Strip "Limits:" informational lines
+        cd = re.sub(r"Limits:.*?\n", "", cd)
+        # Strip "Scripts run in" explanations
+        cd = re.sub(r"Scripts run in [^\n]*\n", "", cd)
+        # Strip "Use normal tool calls instead when"
+        cd = re.sub(
+            r"Use normal tool calls instead when:[^\n]*\n", "", cd
+        )
+        # Clean up multiple consecutive newlines
+        cd = re.sub(r"\n{3,}", "\n\n", cd)
+        cd = cd.strip()
+
+        if len(cd) < len(desc):
+            tool = {
+                **tool,
+                "function": {**func, "description": cd},
+            }
+
+        compressed.append(tool)
+
+    return compressed
+
+
 
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
@@ -489,6 +726,16 @@ def _compute_tool_definitions(
         filtered_tools = sanitize_tool_schemas(filtered_tools)
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
+
+    # Compress tool descriptions to reduce token overhead.
+    # Strips redundant SOUL meta-instructions (e.g. "Do NOT use X — use Y instead"),
+    # verbose example lists, "Also available" utility signatures, "Limits:" info
+    # lines, and "Scripts run in" explanations. Preserves: full parameter schemas,
+    # IMPORTANT/CRITICAL/WARNING constraints, and tool-specific operational facts.
+    try:
+        filtered_tools = _compress_tool_descriptions(filtered_tools)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning("Tool description compression skipped: %s", e)
 
     # ── Tool Search (progressive disclosure) ────────────────────────────
     # Conditionally replace MCP + plugin (non-core) tools with three bridge
