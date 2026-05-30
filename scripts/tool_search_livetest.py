@@ -257,6 +257,7 @@ def setup_isolated_home(enabled: bool) -> Path:
     home_dir = Path(tempfile.mkdtemp(prefix="hermes_ts_live_"))
     hermes_home = home_dir / ".hermes"
     hermes_home.mkdir(parents=True)
+    (hermes_home / "logs").mkdir()
 
     if ORIGINAL_AUTH.exists():
         shutil.copy(ORIGINAL_AUTH, hermes_home / "auth.json")
@@ -277,8 +278,10 @@ def setup_isolated_home(enabled: bool) -> Path:
 
     cfg = {
         "model": {
-            "provider": "openrouter",
-            "model": "anthropic/claude-haiku-4.5",
+            "provider": "custom",
+            "default": "ob1-brain/qwen3.6-35b-a3b-fp8",
+            "base_url": "http://127.0.0.1:8001/v1",
+            "api_key": "487791e5676fdfe718e47222d625551102f07c452d0de411b9d1f0aa6c4fff0",
         },
         "tools": {
             "tool_search": {
@@ -342,18 +345,41 @@ def register_fake_tools() -> int:
 
 def reset_module_state():
     """Drop cached modules so the new HERMES_HOME takes effect."""
+    import logging as _logging
+    from logging.handlers import RotatingFileHandler as _RFH
+
+    # Remove stale file handlers from every live logger before the module
+    # reset. sys.modules eviction doesn't unregister handlers from logger
+    # instances — the old RotatingFileHandler keeps an fd pointing at the
+    # previous (now-deleted) temp HERMES_HOME and raises FileNotFoundError
+    # on the next emit.
+    manager = _logging.Logger.manager
+    all_loggers = [_logging.root] + list(manager.loggerDict.values())
+    for lg in all_loggers:
+        if not isinstance(lg, _logging.Logger):
+            continue
+        for h in list(lg.handlers):
+            if isinstance(h, _RFH):
+                try:
+                    h.close()
+                except Exception:
+                    pass
+                lg.removeHandler(h)
+
     keys = [k for k in sys.modules.keys()
             if k.startswith(("tools.", "model_tools", "toolsets",
-                             "hermes_cli", "agent.", "run_agent"))]
+                             "hermes_cli", "agent.", "run_agent",
+                             "hermes_logging", "hermes_constants"))]
     for k in keys:
         del sys.modules[k]
 
 
 def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> Dict[str, Any]:
     """Run one (scenario, enabled) combination. Returns the recorded transcript."""
-    reset_module_state()
+    # Set HERMES_HOME before reset so re-imported modules see the correct path.
     home = setup_isolated_home(enabled=enabled)
     os.environ["HERMES_HOME"] = str(home)
+    reset_module_state()
 
     # Pre-create the test file used by scenario D.
     Path("/tmp/livetest").mkdir(exist_ok=True)
@@ -384,8 +410,8 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
     try:
         from run_agent import AIAgent
         agent = AIAgent(
-            provider="openrouter",
-            model="anthropic/claude-haiku-4.5",
+            provider="custom",
+            model="ob1-brain/qwen3.6-35b-a3b-fp8",
             enabled_toolsets=None,  # Default = all available toolsets, including the registered mcp-fake tools
             quiet_mode=True,
             save_trajectories=False,
@@ -423,7 +449,7 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
         "scenario_id": scenario["id"],
         "scenario_description": scenario["description"],
         "tool_search_enabled": enabled,
-        "model": "anthropic/claude-haiku-4.5 (via openrouter)",
+        "model": "ob1-brain/qwen3.6-35b-a3b-fp8 (local)",
         "prompt": scenario["prompt"],
         "expected_underlying_tools": scenario.get("expected_underlying_tools", []),
         "n_fake_tools_registered": n_registered,
